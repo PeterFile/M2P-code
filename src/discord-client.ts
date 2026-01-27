@@ -1,5 +1,11 @@
 import WebSocket from 'ws';
 import { ProxyAgent } from 'proxy-agent';
+import { fetch as undiciFetch } from 'undici';
+
+type FetchLike = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Promise<Response>;
 
 type DiscordClientOptions = {
   token: string;
@@ -7,6 +13,7 @@ type DiscordClientOptions = {
   allowedUserIds?: string[];
   allowedChannelIds?: string[];
   requireMention?: boolean;
+  fetchImpl?: FetchLike;
   onChat?: (payload: { chatId?: string; threadId?: string; text: string }) => void;
   onError?: (error: unknown) => void;
   onReady?: () => void;
@@ -86,6 +93,7 @@ export class DiscordClient {
   private allowedUserIds: Set<string>;
   private allowedChannelIds: Set<string>;
   private requireMention: boolean;
+  private fetchImpl: FetchLike;
   private onChat: (payload: { chatId?: string; threadId?: string; text: string }) => void;
   private onError: (error: unknown) => void;
   private onReady: () => void;
@@ -99,6 +107,7 @@ export class DiscordClient {
   private botUserId: string | null;
 
   private channelCache: Map<string, { isThread: boolean; parentId?: string }>;
+  private sendQueue: Map<string, Promise<void>>;
 
   constructor({
     token,
@@ -106,6 +115,7 @@ export class DiscordClient {
     allowedUserIds,
     allowedChannelIds,
     requireMention = false,
+    fetchImpl = undiciFetch as unknown as FetchLike,
     onChat = () => {},
     onError = () => {},
     onReady = () => {},
@@ -115,6 +125,7 @@ export class DiscordClient {
     this.allowedUserIds = normalizeSnowflakeList(allowedUserIds);
     this.allowedChannelIds = normalizeSnowflakeList(allowedChannelIds);
     this.requireMention = requireMention;
+    this.fetchImpl = fetchImpl;
     this.onChat = onChat;
     this.onError = onError;
     this.onReady = onReady;
@@ -127,6 +138,7 @@ export class DiscordClient {
     this.seq = null;
     this.botUserId = null;
     this.channelCache = new Map();
+    this.sendQueue = new Map();
   }
 
   connect(): void {
@@ -160,7 +172,21 @@ export class DiscordClient {
     text: string;
   }): void {
     const channelId = threadId ?? chatId;
-    void this.sendToChannel(channelId, text).catch((err) => this.onError(err));
+    const prev = this.sendQueue.get(channelId) ?? Promise.resolve();
+    const task = async () => {
+      try {
+        await this.sendToChannel(channelId, text);
+      } catch (err) {
+        this.onError(err);
+      }
+    };
+    const next = prev.then(task, task);
+    this.sendQueue.set(channelId, next);
+    void next.finally(() => {
+      if (this.sendQueue.get(channelId) === next) {
+        this.sendQueue.delete(channelId);
+      }
+    });
   }
 
   private openSocket(): void {
@@ -325,11 +351,16 @@ export class DiscordClient {
       return cached;
     }
 
-    const res = await fetch(`${DISCORD_API_BASE}/channels/${channelId}`, {
-      headers: {
-        authorization: `Bot ${this.token}`,
+    const url = `${DISCORD_API_BASE}/channels/${channelId}`;
+    const res = await this.fetchWithRetry(
+      url,
+      {
+        headers: {
+          authorization: `Bot ${this.token}`,
+        },
       },
-    });
+      `GET /channels/${channelId}`,
+    );
     if (!res.ok) {
       throw new Error(`Discord API GET /channels/${channelId} failed: ${res.status}`);
     }
@@ -379,6 +410,26 @@ export class DiscordClient {
     return content.replace(new RegExp(`<@!?${botId}>`, 'g'), '').trim();
   }
 
+  private async fetchWithRetry(
+    url: string,
+    init: RequestInit,
+    context: string,
+  ): Promise<Response> {
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.fetchImpl(url, init);
+      } catch (err) {
+        if (attempt === maxAttempts) {
+          throw new Error(`Discord API fetch failed: ${context}`, { cause: err });
+        }
+        const delayMs = Math.min(2000, 250 * 2 ** (attempt - 1));
+        await sleep(delayMs + Math.floor(Math.random() * 100));
+      }
+    }
+    throw new Error(`Discord API fetch failed: ${context}`);
+  }
+
   private async handleMessageCreate(message: DiscordMessageCreate): Promise<void> {
     if (!message || !message.author) {
       return;
@@ -426,23 +477,36 @@ export class DiscordClient {
   private async sendToChannel(channelId: string, text: string): Promise<void> {
     const chunks = splitDiscordMessage(text);
     for (const chunk of chunks) {
-      const res = await fetch(`${DISCORD_API_BASE}/channels/${channelId}/messages`, {
-        method: 'POST',
-        headers: {
-          authorization: `Bot ${this.token}`,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ content: chunk }),
-      });
-      if (res.status === 429) {
-        const data = (await res.json().catch(() => null)) as { retry_after?: number } | null;
-        const retryAfterMs = Math.max(500, Math.floor((data?.retry_after ?? 1) * 1000));
-        await sleep(retryAfterMs);
-        continue;
-      }
-      if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        throw new Error(`Discord API POST /channels/${channelId}/messages failed: ${res.status} ${body}`);
+      for (;;) {
+        const url = `${DISCORD_API_BASE}/channels/${channelId}/messages`;
+        const res = await this.fetchWithRetry(
+          url,
+          {
+            method: 'POST',
+            headers: {
+              authorization: `Bot ${this.token}`,
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify({ content: chunk }),
+          },
+          `POST /channels/${channelId}/messages`,
+        );
+        if (res.status === 429) {
+          const data = (await res.json().catch(() => null)) as { retry_after?: number } | null;
+          const retryAfterMs = Math.max(
+            500,
+            Math.floor((data?.retry_after ?? 1) * 1000),
+          );
+          await sleep(retryAfterMs);
+          continue;
+        }
+        if (!res.ok) {
+          const body = await res.text().catch(() => '');
+          throw new Error(
+            `Discord API POST /channels/${channelId}/messages failed: ${res.status} ${body}`,
+          );
+        }
+        break;
       }
     }
   }

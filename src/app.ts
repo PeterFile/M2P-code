@@ -43,12 +43,33 @@ export function createApp({
       console.log('[discord] ready');
     },
     onError: (err) => {
-      const msg =
-        err instanceof Error
-          ? err.message
-          : typeof err === 'string'
-            ? err
-            : JSON.stringify(err);
+      if (err instanceof Error) {
+        const cause = (err as { cause?: unknown }).cause;
+        if (cause instanceof Error) {
+          const code =
+            typeof (cause as { code?: unknown }).code === 'string'
+              ? ` code=${(cause as { code?: string }).code}`
+              : '';
+          console.error(
+            `[discord] error ${err.name}: ${err.message} (cause: ${cause.name}: ${cause.message}${code})`,
+          );
+          return;
+        }
+        if (cause) {
+          let causeText = '';
+          try {
+            causeText = JSON.stringify(cause);
+          } catch {
+            causeText = String(cause);
+          }
+          console.error(`[discord] error ${err.name}: ${err.message} (cause: ${causeText})`);
+          return;
+        }
+        console.error(`[discord] error ${err.name}: ${err.message}`);
+        return;
+      }
+
+      const msg = typeof err === 'string' ? err : JSON.stringify(err);
       console.error(`[discord] error ${msg}`);
     },
     onChat: (payload) => {
