@@ -108,3 +108,43 @@ test('permission confirmation forwards to opencode', async () => {
   assert.equal(confirmations.length, 1);
   assert.equal(confirmations[0].allow, true);
 });
+
+test('streams assistant text via message.part.updated', async () => {
+  const instanceManager = createManager();
+  await instanceManager.spawn('backend', '/srv/api');
+  instanceManager.bind('thread-1', 'backend', 'sess-1');
+
+  const replies: { targetId: string; text: string }[] = [];
+  const router = createMessageRouter({
+    instanceManager,
+    openCodeClient: {
+      async sendMessage() {},
+      async respondPermission() {},
+    },
+    sendReply: (targetId, text) => {
+      replies.push({ targetId, text });
+    },
+    streamThrottleMs: 0,
+  });
+
+  await router.handleSseEvent('backend', {
+    type: 'message.updated',
+    properties: { info: { id: 'msg-1', role: 'assistant', sessionID: 'sess-1' } },
+  });
+
+  await router.handleSseEvent('backend', {
+    type: 'message.part.updated',
+    properties: {
+      part: {
+        sessionID: 'sess-1',
+        messageID: 'msg-1',
+        type: 'text',
+        text: 'pong',
+      },
+    },
+  });
+
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].targetId, 'thread-1');
+  assert.equal(replies[0].text, 'pong');
+});

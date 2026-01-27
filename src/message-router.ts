@@ -27,20 +27,45 @@ type OpenCodeClientLike = {
 };
 
 type PermissionProps = {
-  sessionId: string;
+  sessionId?: string;
+  sessionID?: string;
   permissionID: string;
   tool: string;
   details?: { command?: string };
 };
 
 type PartProps = {
-  sessionId: string;
+  sessionId?: string;
+  sessionID?: string;
+  messageId?: string;
+  messageID?: string;
   text?: string;
   delta?: { text?: string };
   part?: { text?: string };
 };
 
 type SessionProps = { sessionId: string };
+
+type MessageInfoProps = {
+  info?: {
+    id?: string;
+    role?: string;
+    sessionId?: string;
+    sessionID?: string;
+  };
+};
+
+type MessagePartProps = {
+  part?: {
+    id?: string;
+    type?: string;
+    text?: string;
+    messageId?: string;
+    messageID?: string;
+    sessionId?: string;
+    sessionID?: string;
+  };
+};
 
 function isApproval(text: string): boolean {
   const normalized = text.trim().toLowerCase();
@@ -68,6 +93,41 @@ function extractTextFromPart(properties: PartProps | null | undefined): string {
   return '';
 }
 
+function extractSessionId(
+  properties:
+    | PermissionProps
+    | PartProps
+    | SessionProps
+    | MessageInfoProps
+    | MessagePartProps
+    | null
+    | undefined,
+): string | null {
+  const p = properties as
+    | {
+        sessionId?: unknown;
+        sessionID?: unknown;
+        info?: { sessionId?: unknown; sessionID?: unknown };
+        part?: { sessionId?: unknown; sessionID?: unknown };
+      }
+    | undefined;
+
+  const candidates = [
+    p?.sessionId,
+    p?.sessionID,
+    p?.info?.sessionId,
+    p?.info?.sessionID,
+    p?.part?.sessionId,
+    p?.part?.sessionID,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
 export function createMessageRouter({
   instanceManager,
   openCodeClient,
@@ -84,6 +144,7 @@ export function createMessageRouter({
     { instanceName: string; sessionId: string; permissionId: string }
   >();
   const streamBuffers = new Map<string, { text: string; lastSentAt: number }>();
+  const messageRoleById = new Map<string, string>();
 
   async function handleChatMessage({
     chatId,
@@ -111,16 +172,20 @@ export function createMessageRouter({
     instanceName: string,
     props: PermissionProps,
   ): Promise<void> {
+    const sessionId = extractSessionId(props);
+    if (!sessionId) {
+      return;
+    }
     const threadId = instanceManager.findThreadByInstanceSession(
       instanceName,
-      props.sessionId,
+      sessionId,
     );
     if (!threadId) {
       return;
     }
     pendingByThread.set(threadId, {
       instanceName,
-      sessionId: props.sessionId,
+      sessionId,
       permissionId: props.permissionID,
     });
     const details = props.details?.command
@@ -166,10 +231,11 @@ export function createMessageRouter({
     instanceName: string,
     props: PartProps,
   ): Promise<void> {
-    const threadId = instanceManager.findThreadByInstanceSession(
-      instanceName,
-      props.sessionId,
-    );
+    const sessionId = extractSessionId(props);
+    if (!sessionId) {
+      return;
+    }
+    const threadId = instanceManager.findThreadByInstanceSession(instanceName, sessionId);
     if (!threadId) {
       return;
     }
@@ -177,7 +243,7 @@ export function createMessageRouter({
     if (!text) {
       return;
     }
-    const buffer = getStreamBuffer(props.sessionId);
+    const buffer = getStreamBuffer(sessionId);
     buffer.text = text;
     const now = Date.now();
     if (now - buffer.lastSentAt < streamThrottleMs) {
@@ -191,18 +257,22 @@ export function createMessageRouter({
     instanceName: string,
     props: SessionProps,
   ): Promise<void> {
+    const sessionId = extractSessionId(props);
+    if (!sessionId) {
+      return;
+    }
     const threadId = instanceManager.findThreadByInstanceSession(
       instanceName,
-      props.sessionId,
+      sessionId,
     );
     if (!threadId) {
       return;
     }
-    const buffer = streamBuffers.get(props.sessionId);
+    const buffer = streamBuffers.get(sessionId);
     if (buffer?.text) {
       sendReply(threadId, buffer.text);
     }
-    streamBuffers.delete(props.sessionId);
+    streamBuffers.delete(sessionId);
   }
 
   async function handleSseEvent(
@@ -222,12 +292,57 @@ export function createMessageRouter({
           data.properties as PartProps,
         );
         break;
+      case 'message.updated': {
+        const props = data.properties as MessageInfoProps;
+        const id = props?.info?.id;
+        const role = props?.info?.role;
+        if (typeof id === 'string' && id.trim() && typeof role === 'string' && role.trim()) {
+          messageRoleById.set(id, role);
+        }
+        break;
+      }
+      case 'message.part.updated': {
+        const props = data.properties as MessagePartProps;
+        const part = props?.part;
+        const messageId = typeof part?.messageID === 'string' ? part.messageID : part?.messageId;
+        if (!messageId) {
+          break;
+        }
+        const role = messageRoleById.get(messageId);
+        if (role !== 'assistant') {
+          break;
+        }
+        if (part?.type !== 'text') {
+          break;
+        }
+        await handleStreamingUpdate(instanceName, {
+          sessionID: part.sessionID,
+          sessionId: part.sessionId,
+          text: part.text,
+        });
+        break;
+      }
       case 'session.completed':
         await handleSessionComplete(
           instanceName,
           data.properties as SessionProps,
         );
         break;
+      case 'session.idle': {
+        const sessionId = extractSessionId(data.properties as SessionProps);
+        if (sessionId) {
+          await handleSessionComplete(instanceName, { sessionId });
+        }
+        break;
+      }
+      case 'session.status': {
+        const p = data.properties as { sessionID?: string; sessionId?: string; status?: { type?: string } };
+        const sessionId = extractSessionId(p as unknown as SessionProps);
+        if (sessionId && p?.status?.type === 'idle') {
+          await handleSessionComplete(instanceName, { sessionId });
+        }
+        break;
+      }
       default:
         break;
     }
