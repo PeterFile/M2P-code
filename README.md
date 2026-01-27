@@ -81,6 +81,8 @@ export NO_PROXY='localhost,127.0.0.1,::1'
 
 ⚠️ 本项目使用 `undici` 的 `EnvHttpProxyAgent`（实验性 API）让 `fetch()` 尊重 `HTTP(S)_PROXY/NO_PROXY`；Discord Gateway 连接使用 `ws` + `proxy-agent`。
 
+注意：只设置 `ALL_PROXY/all_proxy`（常见为 `socks5://...`）通常**不够**，Discord REST 的 `fetch()` 不会走 SOCKS；请明确设置 `HTTP_PROXY/HTTPS_PROXY` 为你的 **HTTP** 代理地址。
+
 ### Discord 侧必要开关
 
 在 Discord Dev Portal → Bot → Privileged Gateway Intents：

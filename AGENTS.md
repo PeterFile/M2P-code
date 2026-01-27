@@ -38,3 +38,4 @@
 - 开发/测试使用 `tsx`，构建使用 `tsc`。
 - Discord 侧读取频道消息依赖 **Message Content Intent**；未开启时，Bot 可能能收到事件但 `message.content` 为空，表现为“没反应”。
 - 代理环境：Discord REST 走 `fetch()`（undici `EnvHttpProxyAgent`），Discord Gateway 走 `ws`（`proxy-agent`）；优先用 `curl --noproxy '*' https://discord.com/api/v10/gateway` 判断是否必须配置代理。
+- 仅设置 `ALL_PROXY/all_proxy`（SOCKS）通常不足以让 Discord REST 工作；务必设置 `HTTP_PROXY/HTTPS_PROXY`（HTTP 代理），否则会出现 `fetch failed`/`UND_ERR_CONNECT_TIMEOUT`。
