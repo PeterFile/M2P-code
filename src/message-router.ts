@@ -132,18 +132,26 @@ export function createMessageRouter({
   instanceManager,
   openCodeClient,
   sendReply,
-  streamThrottleMs = 1000,
+  sendStreamReply,
+  clearStreamSession,
+  streamThrottleMs = 1500,
 }: {
   instanceManager: InstanceManagerLike;
   openCodeClient: OpenCodeClientLike;
   sendReply: (targetId: string, text: string) => void;
+  sendStreamReply?: (targetId: string, sessionKey: string, text: string) => void;
+  clearStreamSession?: (sessionKey: string) => void;
   streamThrottleMs?: number;
 }) {
   const pendingByThread = new Map<
     string,
     { instanceName: string; sessionId: string; permissionId: string }
   >();
-  const streamBuffers = new Map<string, { text: string; lastSentAt: number }>();
+  const streamBuffers = new Map<
+    string,
+    { text: string; lastSentAt: number; sentLength: number }
+  >();
+  const streamSourceBySession = new Map<string, 'part' | 'messagePart'>();
   const messageRoleById = new Map<string, string>();
 
   async function handleChatMessage({
@@ -222,16 +230,34 @@ export function createMessageRouter({
 
   function getStreamBuffer(sessionId: string) {
     if (!streamBuffers.has(sessionId)) {
-      streamBuffers.set(sessionId, { text: '', lastSentAt: 0 });
+      // Clear any stale streaming message from previous session to ensure fresh messageId
+      clearStreamSession?.(sessionId);
+      streamBuffers.set(sessionId, { text: '', lastSentAt: Date.now(), sentLength: 0 });
     }
     return streamBuffers.get(sessionId)!;
+  }
+
+  function applyStreamText(buffer: { text: string }, fragment: string): void {
+    if (!fragment) {
+      return;
+    }
+    const prev = buffer.text;
+    if (!prev || fragment.startsWith(prev)) {
+      buffer.text = fragment;
+      return;
+    }
+    if (prev.endsWith(fragment)) {
+      return;
+    }
+    buffer.text = prev + fragment;
   }
 
   async function handleStreamingUpdate(
     instanceName: string,
     props: PartProps,
+    sessionIdOverride?: string | null,
   ): Promise<void> {
-    const sessionId = extractSessionId(props);
+    const sessionId = sessionIdOverride ?? extractSessionId(props);
     if (!sessionId) {
       return;
     }
@@ -239,18 +265,27 @@ export function createMessageRouter({
     if (!threadId) {
       return;
     }
-    const text = extractTextFromPart(props);
-    if (!text) {
+    const fragment = extractTextFromPart(props);
+    if (!fragment) {
       return;
     }
     const buffer = getStreamBuffer(sessionId);
-    buffer.text = text;
+    applyStreamText(buffer, fragment);
+    // Throttled streaming: send/edit message at intervals
     const now = Date.now();
     if (now - buffer.lastSentAt < streamThrottleMs) {
       return;
     }
+    if (!buffer.text) {
+      return;
+    }
     buffer.lastSentAt = now;
-    sendReply(threadId, buffer.text);
+    buffer.sentLength = buffer.text.length;
+    if (sendStreamReply) {
+      sendStreamReply(threadId, sessionId, buffer.text);
+    } else {
+      sendReply(threadId, buffer.text);
+    }
   }
 
   async function handleSessionComplete(
@@ -269,10 +304,17 @@ export function createMessageRouter({
       return;
     }
     const buffer = streamBuffers.get(sessionId);
-    if (buffer?.text) {
-      sendReply(threadId, buffer.text);
+    if (buffer?.text && buffer.text.length > buffer.sentLength) {
+      // Send final content if there's unsent text
+      if (sendStreamReply) {
+        sendStreamReply(threadId, sessionId, buffer.text);
+      } else {
+        sendReply(threadId, buffer.text);
+      }
     }
     streamBuffers.delete(sessionId);
+    streamSourceBySession.delete(sessionId);
+    clearStreamSession?.(sessionId);
   }
 
   async function handleSseEvent(
@@ -286,12 +328,22 @@ export function createMessageRouter({
           data.properties as PermissionProps,
         );
         break;
-      case 'part.updated':
+      case 'part.updated': {
+        const props = data.properties as PartProps;
+        const sessionId = extractSessionId(props);
+        if (sessionId && streamSourceBySession.get(sessionId) === 'messagePart') {
+          break;
+        }
+        if (sessionId) {
+          streamSourceBySession.set(sessionId, 'part');
+        }
         await handleStreamingUpdate(
           instanceName,
-          data.properties as PartProps,
+          props,
+          sessionId,
         );
         break;
+      }
       case 'message.updated': {
         const props = data.properties as MessageInfoProps;
         const id = props?.info?.id;
@@ -315,11 +367,15 @@ export function createMessageRouter({
         if (part?.type !== 'text') {
           break;
         }
+        const sessionId = extractSessionId(part as unknown as SessionProps);
+        if (sessionId) {
+          streamSourceBySession.set(sessionId, 'messagePart');
+        }
         await handleStreamingUpdate(instanceName, {
           sessionID: part.sessionID,
           sessionId: part.sessionId,
           text: part.text,
-        });
+        }, sessionId);
         break;
       }
       case 'session.completed':

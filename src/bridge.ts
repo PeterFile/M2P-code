@@ -5,6 +5,8 @@ type GatewayClientLike = {
   connect: () => void;
   disconnect: () => void;
   sendMessage: (payload: { chatId: string; threadId?: string | null; text: string }) => void;
+  sendOrEditMessage?: (payload: { chatId: string; threadId?: string | null; sessionKey: string; text: string }) => void;
+  clearStreamingMessage?: (sessionKey: string) => void;
 };
 
 type InstanceSummary = {
@@ -65,10 +67,30 @@ export function createBridge({
     gatewayClient.sendMessage({ chatId: targetId, text });
   };
 
+  const sendStreamReply = (targetId: string, sessionKey: string, text: string) => {
+    if (!gatewayClient.sendOrEditMessage) {
+      // Fallback to regular send if streaming not supported
+      sendReply(targetId, text);
+      return;
+    }
+    const chatId = threadChatMap.get(targetId);
+    if (chatId) {
+      gatewayClient.sendOrEditMessage({ chatId, threadId: targetId, sessionKey, text });
+      return;
+    }
+    gatewayClient.sendOrEditMessage({ chatId: targetId, sessionKey, text });
+  };
+
+  const clearStreamSession = (sessionKey: string) => {
+    gatewayClient.clearStreamingMessage?.(sessionKey);
+  };
+
   const router = createMessageRouter({
     instanceManager,
     openCodeClient,
     sendReply,
+    sendStreamReply,
+    clearStreamSession,
     streamThrottleMs,
   });
 

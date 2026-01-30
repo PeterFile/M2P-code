@@ -109,12 +109,12 @@ test('permission confirmation forwards to opencode', async () => {
   assert.equal(confirmations[0].allow, true);
 });
 
-test('streams assistant text via message.part.updated', async () => {
+test('streams assistant text via sendStreamReply with session key', async () => {
   const instanceManager = createManager();
   await instanceManager.spawn('backend', '/srv/api');
   instanceManager.bind('thread-1', 'backend', 'sess-1');
 
-  const replies: { targetId: string; text: string }[] = [];
+  const replies: { targetId: string; text: string; sessionKey?: string }[] = [];
   const router = createMessageRouter({
     instanceManager,
     openCodeClient: {
@@ -123,6 +123,9 @@ test('streams assistant text via message.part.updated', async () => {
     },
     sendReply: (targetId, text) => {
       replies.push({ targetId, text });
+    },
+    sendStreamReply: (targetId, sessionKey, text) => {
+      replies.push({ targetId, text, sessionKey });
     },
     streamThrottleMs: 0,
   });
@@ -144,7 +147,81 @@ test('streams assistant text via message.part.updated', async () => {
     },
   });
 
+  // Streaming sends immediately with throttle=0
   assert.equal(replies.length, 1);
   assert.equal(replies[0].targetId, 'thread-1');
   assert.equal(replies[0].text, 'pong');
+  assert.equal(replies[0].sessionKey, 'sess-1');
+
+  // Session complete should not duplicate if no new content
+  await router.handleSseEvent('backend', {
+    type: 'session.completed',
+    properties: { sessionId: 'sess-1' },
+  });
+
+  assert.equal(replies.length, 1);
+});
+
+test('streaming updates send cumulative text via sendStreamReply', async () => {
+  const instanceManager = createManager();
+  await instanceManager.spawn('backend', '/srv/api');
+  instanceManager.bind('thread-1', 'backend', 'sess-1');
+
+  const replies: { targetId: string; text: string; sessionKey?: string }[] = [];
+  const router = createMessageRouter({
+    instanceManager,
+    openCodeClient: {
+      async sendMessage() {},
+      async respondPermission() {},
+    },
+    sendReply: (targetId, text) => {
+      replies.push({ targetId, text });
+    },
+    sendStreamReply: (targetId, sessionKey, text) => {
+      replies.push({ targetId, text, sessionKey });
+    },
+    streamThrottleMs: 0,
+  });
+
+  await router.handleSseEvent('backend', {
+    type: 'message.updated',
+    properties: { info: { id: 'msg-1', role: 'assistant', sessionID: 'sess-1' } },
+  });
+
+  await router.handleSseEvent('backend', {
+    type: 'message.part.updated',
+    properties: {
+      part: {
+        sessionID: 'sess-1',
+        messageID: 'msg-1',
+        type: 'text',
+        text: 'hello',
+      },
+    },
+  });
+
+  await router.handleSseEvent('backend', {
+    type: 'message.part.updated',
+    properties: {
+      part: {
+        sessionID: 'sess-1',
+        messageID: 'msg-1',
+        type: 'text',
+        text: 'hello world',
+      },
+    },
+  });
+
+  // Each update triggers a send with cumulative text
+  assert.equal(replies.length, 2);
+  assert.equal(replies[0].text, 'hello');
+  assert.equal(replies[1].text, 'hello world');
+
+  await router.handleSseEvent('backend', {
+    type: 'session.completed',
+    properties: { sessionId: 'sess-1' },
+  });
+
+  // No duplicate on completion since text already sent
+  assert.equal(replies.length, 2);
 });

@@ -108,6 +108,7 @@ export class DiscordClient {
 
   private channelCache: Map<string, { isThread: boolean; parentId?: string }>;
   private sendQueue: Map<string, Promise<void>>;
+  private streamingMessages: Map<string, { channelId: string; messageId: string }>;
 
   constructor({
     token,
@@ -139,6 +140,7 @@ export class DiscordClient {
     this.botUserId = null;
     this.channelCache = new Map();
     this.sendQueue = new Map();
+    this.streamingMessages = new Map();
   }
 
   connect(): void {
@@ -474,8 +476,9 @@ export class DiscordClient {
     this.onChat({ chatId, threadId, text });
   }
 
-  private async sendToChannel(channelId: string, text: string): Promise<void> {
+  private async sendToChannel(channelId: string, text: string): Promise<string | null> {
     const chunks = splitDiscordMessage(text);
+    let lastMessageId: string | null = null;
     for (const chunk of chunks) {
       for (;;) {
         const url = `${DISCORD_API_BASE}/channels/${channelId}/messages`;
@@ -506,8 +509,125 @@ export class DiscordClient {
             `Discord API POST /channels/${channelId}/messages failed: ${res.status} ${body}`,
           );
         }
+        const resData = (await res.json().catch(() => null)) as { id?: string } | null;
+        lastMessageId = resData?.id ?? null;
         break;
       }
     }
+    return lastMessageId;
+  }
+
+  private async editMessageInChannel(channelId: string, messageId: string, text: string): Promise<void> {
+    const truncated = text.length > 2000 ? text.slice(0, 1997) + '...' : text;
+    for (;;) {
+      const url = `${DISCORD_API_BASE}/channels/${channelId}/messages/${messageId}`;
+      const res = await this.fetchWithRetry(
+        url,
+        {
+          method: 'PATCH',
+          headers: {
+            authorization: `Bot ${this.token}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ content: truncated }),
+        },
+        `PATCH /channels/${channelId}/messages/${messageId}`,
+      );
+      if (res.status === 429) {
+        const data = (await res.json().catch(() => null)) as { retry_after?: number } | null;
+        const retryAfterMs = Math.max(
+          500,
+          Math.floor((data?.retry_after ?? 1) * 1000),
+        );
+        await sleep(retryAfterMs);
+        continue;
+      }
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(
+          `Discord API PATCH /channels/${channelId}/messages/${messageId} failed: ${res.status} ${body}`,
+        );
+      }
+      break;
+    }
+  }
+
+  private async sendSingleMessage(channelId: string, text: string): Promise<string | null> {
+    // Truncate to single message for streaming, never chunk
+    const truncated = text.length > 2000 ? text.slice(0, 1997) + '...' : text;
+    for (;;) {
+      const url = `${DISCORD_API_BASE}/channels/${channelId}/messages`;
+      const res = await this.fetchWithRetry(
+        url,
+        {
+          method: 'POST',
+          headers: {
+            authorization: `Bot ${this.token}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ content: truncated }),
+        },
+        `POST /channels/${channelId}/messages`,
+      );
+      if (res.status === 429) {
+        const data = (await res.json().catch(() => null)) as { retry_after?: number } | null;
+        const retryAfterMs = Math.max(
+          500,
+          Math.floor((data?.retry_after ?? 1) * 1000),
+        );
+        await sleep(retryAfterMs);
+        continue;
+      }
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(
+          `Discord API POST /channels/${channelId}/messages failed: ${res.status} ${body}`,
+        );
+      }
+      const resData = (await res.json().catch(() => null)) as { id?: string } | null;
+      return resData?.id ?? null;
+    }
+  }
+
+  sendOrEditMessage({
+    chatId,
+    threadId,
+    sessionKey,
+    text,
+  }: {
+    chatId: string;
+    threadId?: string | null;
+    sessionKey: string;
+    text: string;
+  }): void {
+    const channelId = threadId ?? chatId;
+    const prev = this.sendQueue.get(channelId) ?? Promise.resolve();
+    const task = async () => {
+      try {
+        const existing = this.streamingMessages.get(sessionKey);
+        if (existing && existing.channelId === channelId) {
+          await this.editMessageInChannel(channelId, existing.messageId, text);
+        } else {
+          // For streaming: send single truncated message, never chunk
+          const msgId = await this.sendSingleMessage(channelId, text);
+          if (msgId) {
+            this.streamingMessages.set(sessionKey, { channelId, messageId: msgId });
+          }
+        }
+      } catch (err) {
+        this.onError(err);
+      }
+    };
+    const next = prev.then(task, task);
+    this.sendQueue.set(channelId, next);
+    void next.finally(() => {
+      if (this.sendQueue.get(channelId) === next) {
+        this.sendQueue.delete(channelId);
+      }
+    });
+  }
+
+  clearStreamingMessage(sessionKey: string): void {
+    this.streamingMessages.delete(sessionKey);
   }
 }
