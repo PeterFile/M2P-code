@@ -630,4 +630,40 @@ export class DiscordClient {
   clearStreamingMessage(sessionKey: string): void {
     this.streamingMessages.delete(sessionKey);
   }
+
+  async deleteAndClearStreamingMessage(sessionKey: string): Promise<void> {
+    const info = this.streamingMessages.get(sessionKey);
+    if (info) {
+      this.streamingMessages.delete(sessionKey);
+      await this.deleteMessage(info.channelId, info.messageId);
+    }
+  }
+
+  private async deleteMessage(channelId: string, messageId: string): Promise<void> {
+    try {
+      const url = `${DISCORD_API_BASE}/channels/${channelId}/messages/${messageId}`;
+      const res = await this.fetchWithRetry(
+        url,
+        {
+          method: 'DELETE',
+          headers: {
+            authorization: `Bot ${this.token}`,
+          },
+        },
+        `DELETE /channels/${channelId}/messages/${messageId}`,
+      );
+      if (res.status === 429) {
+        const data = (await res.json().catch(() => null)) as { retry_after?: number } | null;
+        const retryAfterMs = Math.max(
+          500,
+          Math.floor((data?.retry_after ?? 1) * 1000),
+        );
+        await sleep(retryAfterMs);
+        return this.deleteMessage(channelId, messageId);
+      }
+      // Ignore errors (message may already be deleted)
+    } catch {
+      // Silently ignore delete failures
+    }
+  }
 }

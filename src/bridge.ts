@@ -7,6 +7,7 @@ type GatewayClientLike = {
   sendMessage: (payload: { chatId: string; threadId?: string | null; text: string }) => void;
   sendOrEditMessage?: (payload: { chatId: string; threadId?: string | null; sessionKey: string; text: string }) => void;
   clearStreamingMessage?: (sessionKey: string) => void;
+  deleteAndClearStreamingMessage?: (sessionKey: string) => Promise<void>;
 };
 
 type InstanceSummary = {
@@ -85,12 +86,17 @@ export function createBridge({
     gatewayClient.clearStreamingMessage?.(sessionKey);
   };
 
+  const deleteStreamPreview = async (sessionKey: string) => {
+    await gatewayClient.deleteAndClearStreamingMessage?.(sessionKey);
+  };
+
   const router = createMessageRouter({
     instanceManager,
     openCodeClient,
     sendReply,
     sendStreamReply,
     clearStreamSession,
+    deleteStreamPreview,
     streamThrottleMs,
   });
 

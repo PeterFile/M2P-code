@@ -134,6 +134,7 @@ export function createMessageRouter({
   sendReply,
   sendStreamReply,
   clearStreamSession,
+  deleteStreamPreview,
   streamThrottleMs = 1500,
 }: {
   instanceManager: InstanceManagerLike;
@@ -141,6 +142,7 @@ export function createMessageRouter({
   sendReply: (targetId: string, text: string) => void;
   sendStreamReply?: (targetId: string, sessionKey: string, text: string) => void;
   clearStreamSession?: (sessionKey: string) => void;
+  deleteStreamPreview?: (sessionKey: string) => Promise<void>;
   streamThrottleMs?: number;
 }) {
   const pendingByThread = new Map<
@@ -304,17 +306,29 @@ export function createMessageRouter({
       return;
     }
     const buffer = streamBuffers.get(sessionId);
-    if (buffer?.text && buffer.text.length > buffer.sentLength) {
-      // Send final content if there's unsent text
-      if (sendStreamReply) {
-        sendStreamReply(threadId, sessionId, buffer.text);
-      } else {
-        sendReply(threadId, buffer.text);
+    const fullText = buffer?.text ?? '';
+    const wasTruncated = buffer && buffer.sentLength > 0 && fullText.length > 2000;
+
+    if (wasTruncated && deleteStreamPreview) {
+      // B1: Delete preview message and send full content (may be chunked)
+      await deleteStreamPreview(sessionId);
+      if (fullText) {
+        sendReply(threadId, fullText);
       }
+    } else if (fullText && fullText.length > (buffer?.sentLength ?? 0)) {
+      // Just send remaining unsent content
+      if (sendStreamReply) {
+        sendStreamReply(threadId, sessionId, fullText);
+      } else {
+        sendReply(threadId, fullText);
+      }
+      clearStreamSession?.(sessionId);
+    } else {
+      clearStreamSession?.(sessionId);
     }
+
     streamBuffers.delete(sessionId);
     streamSourceBySession.delete(sessionId);
-    clearStreamSession?.(sessionId);
   }
 
   async function handleSseEvent(
@@ -384,21 +398,12 @@ export function createMessageRouter({
           data.properties as SessionProps,
         );
         break;
-      case 'session.idle': {
-        const sessionId = extractSessionId(data.properties as SessionProps);
-        if (sessionId) {
-          await handleSessionComplete(instanceName, { sessionId });
-        }
+      // session.idle and session.status are NOT used for B1 completion
+      // They fire multiple times during streaming and would cause duplicates
+      case 'session.idle':
+      case 'session.status':
+        // No-op: wait for session.completed only
         break;
-      }
-      case 'session.status': {
-        const p = data.properties as { sessionID?: string; sessionId?: string; status?: { type?: string } };
-        const sessionId = extractSessionId(p as unknown as SessionProps);
-        if (sessionId && p?.status?.type === 'idle') {
-          await handleSessionComplete(instanceName, { sessionId });
-        }
-        break;
-      }
       default:
         break;
     }
