@@ -155,6 +155,7 @@ export function createMessageRouter({
   >();
   const streamSourceBySession = new Map<string, 'part' | 'messagePart'>();
   const messageRoleById = new Map<string, string>();
+  const activePartBySession = new Map<string, string>(); // sessionId -> active partId
 
   async function handleChatMessage({
     chatId,
@@ -171,9 +172,17 @@ export function createMessageRouter({
       sendReply(targetId, '⚠️ 未绑定实例，请使用 /instances 查看或 /spawn 创建');
       return;
     }
+
+    // Clear previous streaming state to ensure new response creates fresh message
+    const { sessionId } = binding;
+    streamBuffers.delete(sessionId);
+    streamSourceBySession.delete(sessionId);
+    activePartBySession.delete(sessionId);
+    clearStreamSession?.(sessionId);
+
     await openCodeClient.sendMessage(
       binding.instance.port,
-      binding.sessionId,
+      sessionId,
       text,
     );
   }
@@ -239,25 +248,11 @@ export function createMessageRouter({
     return streamBuffers.get(sessionId)!;
   }
 
-  function applyStreamText(buffer: { text: string }, fragment: string): void {
-    if (!fragment) {
-      return;
-    }
-    const prev = buffer.text;
-    if (!prev || fragment.startsWith(prev)) {
-      buffer.text = fragment;
-      return;
-    }
-    if (prev.endsWith(fragment)) {
-      return;
-    }
-    buffer.text = prev + fragment;
-  }
-
   async function handleStreamingUpdate(
     instanceName: string,
     props: PartProps,
     sessionIdOverride?: string | null,
+    partIdOverride?: string | null,
   ): Promise<void> {
     const sessionId = sessionIdOverride ?? extractSessionId(props);
     if (!sessionId) {
@@ -271,8 +266,30 @@ export function createMessageRouter({
     if (!fragment) {
       return;
     }
+
     const buffer = getStreamBuffer(sessionId);
-    applyStreamText(buffer, fragment);
+    const currentPartId = activePartBySession.get(sessionId);
+    const newPartId = partIdOverride ?? null;
+
+    // If partId changed (new part started), reset buffer to new part's content
+    // This handles the case where thinking part switches to response part
+    if (newPartId && currentPartId && newPartId !== currentPartId) {
+      buffer.text = fragment;
+      activePartBySession.set(sessionId, newPartId);
+    } else {
+      // Same part or no partId tracking: use cumulative logic
+      if (newPartId && !currentPartId) {
+        activePartBySession.set(sessionId, newPartId);
+      }
+      // If fragment contains buffer content (cumulative mode), just use fragment
+      if (!buffer.text || fragment.startsWith(buffer.text)) {
+        buffer.text = fragment;
+      } else if (!buffer.text.endsWith(fragment)) {
+        // Delta mode: append only if not duplicate
+        buffer.text = buffer.text + fragment;
+      }
+    }
+
     // Throttled streaming: send/edit message at intervals
     const now = Date.now();
     if (now - buffer.lastSentAt < streamThrottleMs) {
@@ -307,28 +324,28 @@ export function createMessageRouter({
     }
     const buffer = streamBuffers.get(sessionId);
     const fullText = buffer?.text ?? '';
-    const wasTruncated = buffer && buffer.sentLength > 0 && fullText.length > 2000;
+    const hadPreview = buffer && buffer.sentLength > 0;
 
-    if (wasTruncated && deleteStreamPreview) {
-      // B1: Delete preview message and send full content (may be chunked)
-      await deleteStreamPreview(sessionId);
-      if (fullText) {
-        sendReply(threadId, fullText);
-      }
-    } else if (fullText && fullText.length > (buffer?.sentLength ?? 0)) {
-      // Just send remaining unsent content
-      if (sendStreamReply) {
-        sendStreamReply(threadId, sessionId, fullText);
-      } else {
-        sendReply(threadId, fullText);
-      }
-      clearStreamSession?.(sessionId);
-    } else {
-      clearStreamSession?.(sessionId);
-    }
-
+    // Always clean up stream state first
     streamBuffers.delete(sessionId);
     streamSourceBySession.delete(sessionId);
+    activePartBySession.delete(sessionId);
+
+    if (!fullText) {
+      clearStreamSession?.(sessionId);
+      return;
+    }
+
+    if (hadPreview && deleteStreamPreview) {
+      // Delete the preview message (which was truncated to 2000 chars)
+      // then send the full content using sendReply (which can chunk if needed)
+      await deleteStreamPreview(sessionId);
+      sendReply(threadId, fullText);
+    } else {
+      // No preview was sent, just send the full content normally
+      clearStreamSession?.(sessionId);
+      sendReply(threadId, fullText);
+    }
   }
 
   async function handleSseEvent(
@@ -385,24 +402,24 @@ export function createMessageRouter({
         if (sessionId) {
           streamSourceBySession.set(sessionId, 'messagePart');
         }
+        const partId = typeof part.id === 'string' ? part.id : undefined;
         await handleStreamingUpdate(instanceName, {
           sessionID: part.sessionID,
           sessionId: part.sessionId,
           text: part.text,
-        }, sessionId);
+        }, sessionId, partId);
         break;
       }
-      case 'session.completed':
+      case 'session.idle':
+        // OpenCode signals completion via session.idle, not session.completed
         await handleSessionComplete(
           instanceName,
           data.properties as SessionProps,
         );
         break;
-      // session.idle and session.status are NOT used for B1 completion
-      // They fire multiple times during streaming and would cause duplicates
-      case 'session.idle':
+      case 'session.completed':
       case 'session.status':
-        // No-op: wait for session.completed only
+        // No-op: session.completed is not used by OpenCode; status fires during streaming
         break;
       default:
         break;
